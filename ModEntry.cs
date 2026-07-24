@@ -1064,8 +1064,8 @@ public class ModEntry : Mod
                     // Calculate damage with some randomness
                     var rng = Game1.random;
                     int dmg = rng.Next(baseDmgMin, baseDmgMax + 1);
-                    bool crit = rng.NextDouble() < 0.05 + farmer.critChance.Value;
-                    if (crit) dmg = (int)(dmg * (2.0 + farmer.critPower.Value));
+                    bool crit = rng.NextDouble() < 0.05 + weapon.critChance.Value;
+                    if (crit) dmg = (int)(dmg * (2.0 + weapon.critMultiplier.Value));
 
                     // Apply damage
                     int prevHp = target.Health;
@@ -1077,7 +1077,7 @@ public class ModEntry : Mod
                     double counterChance = Math.Max(0, 0.4 - minDist * 0.06);
                     if (rng.NextDouble() < counterChance)
                     {
-                        int monsterDmg = Math.Max(1, target.DamageToFarmer - farmer.resilience.Value);
+                        int monsterDmg = Math.Max(1, target.DamageToFarmer - farmer.CombatLevel);
                         farmer.health = Math.Max(1, farmer.health - monsterDmg);
                         damageTaken += monsterDmg;
                     }
@@ -1869,15 +1869,15 @@ public class ModEntry : Mod
                 var bedY = 6;
                 if (homeLoc is StardewValley.Locations.FarmHouse fh)
                 {
-                    var bedSpot = fh.GetPlayerBedPosition();
-                    bedX = (int)(bedSpot.X / 64);
-                    bedY = (int)(bedSpot.Y / 64);
+                    var bedSpot = fh.GetPlayerBedSpot();
+                    bedX = bedSpot.X;
+                    bedY = bedSpot.Y;
                 }
                 else if (homeLoc is StardewValley.Locations.Cabin cab)
                 {
-                    var bedSpot = cab.GetPlayerBedPosition();
-                    bedX = (int)(bedSpot.X / 64);
-                    bedY = (int)(bedSpot.Y / 64);
+                    var bedSpot = cab.GetPlayerBedSpot();
+                    bedX = bedSpot.X;
+                    bedY = bedSpot.Y;
                 }
 
                 var needsWarp = farmer.currentLocation.Name != homeLoc.Name;
