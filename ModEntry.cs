@@ -725,6 +725,7 @@ public class ModEntry : Mod
                 "/chat/push" => HandleChatPush(ctx),
                 "/chat/history" => HandleChatHistory(),
                 "/cast" => HandleCast(ctx),
+                "/ai-fish" => HandleAiFish(ctx),
                 _ => throw new InvalidOperationException($"Unknown endpoint: {path}")
             };
 
@@ -1138,6 +1139,503 @@ public class ModEntry : Mod
             }
         });
         return tcs.Task.GetAwaiter().GetResult();
+    }
+
+    // ============================================================
+    // AI Fishing Minigame System
+    // ============================================================
+
+    private static readonly string[][] AiFishPatterns = new[]
+    {
+        new[] { "rush","calm","rush","calm","rush","calm" },       // 0: alternating rush/calm
+        new[] { "struggle","dive","struggle","dive","struggle" },  // 1: alternating struggle/dive
+        new[] { "calm","calm","dive","rush","rush","rush" },       // 2: buildup
+        new[] { "rush","rush","struggle","dive","calm","calm" },   // 3: fadeout
+        new[] { "calm","calm","rush","calm","calm","rush" },       // 4: pulse
+        new[] { "calm","struggle","rush","struggle","calm" },      // 5: mirror
+        new[] { "rush","rush","rush","rush","rush","rush" },       // 6: stubborn rush
+        new[] { "struggle","struggle","struggle","struggle" },     // 7: stubborn struggle
+        new[] { "calm","dive","struggle","struggle","rush" },      // 8: accelerating
+        new[] { "calm","struggle","rush","dive","calm" },          // 9: spiral
+        new[] { "calm","calm","calm","rush","rush","rush" },       // 10: bait trap
+        new[] { "calm","rush","dive","rush","calm","rush" },       // 11: zigzag
+    };
+
+    private static readonly string[] AiFishPatternNames = new[]
+    {
+        "交替型(冲↔静)", "交替型(挣↔潜)", "蓄力型", "衰减型",
+        "脉冲型", "镜像型", "固执型(冲)", "固执型(挣)",
+        "加速型", "回旋型", "诱饵型", "锯齿型"
+    };
+
+    private static readonly Dictionary<string, string> AiFishClues = new()
+    {
+        ["calm"] = "鱼在水面缓缓游动",
+        ["struggle"] = "鱼线在微微颤抖",
+        ["rush"] = "水面突然炸开一片水花",
+        ["dive"] = "鱼竿被猛地向下拽",
+    };
+
+    private static readonly string[] AiFishTaunts = new[]
+    {
+        "聪明反被聪明误！鱼溜了~",
+        "鱼王回头看了你一眼，带着不屑游走了",
+        "你感觉到鱼线一松——它在笑你",
+        "读心失败，反被鱼读了心",
+        "这条鱼的智商可能比你高",
+        "鱼：就这？",
+        "线断了，鱼带着你的自信游走了",
+        "张力爆表！鱼竿发出不满的嘎吱声",
+        "你以为你读懂了它，其实它在遛你",
+        "鱼使出了假动作，你上当了",
+    };
+
+    private class AiFishState
+    {
+        public int Difficulty;
+        public int TotalPhases;
+        public int CurrentPhase;
+        public double Progress;
+        public double Tension;
+        public double TensionMax;
+        public double ProgressMult;
+        public double LossReduce;
+        public double TensionResist;
+        public double ProgressBonus;
+        public double ClueBonus;
+        public int PatternIdx;
+        public string[] BehaviorSeq = Array.Empty<string>();
+        public List<object> History = new();
+        public Random Rng = new();
+        public string RodName = "";
+        public string TackleName = "";
+        public string BaitName = "";
+    }
+
+    private AiFishState? _aiFishState;
+
+    private object HandleAiFish(HttpListenerContext ctx)
+    {
+        var p = ReadJson(ctx);
+        var action = GetParamOr(p, "action", "cast");
+
+        if (action == "cast")
+            return AiFishCast(p);
+        else if (action == "decide")
+            return AiFishDecide(p);
+        else if (action == "status")
+            return _aiFishState != null
+                ? new { ok = true, active = true, phase = _aiFishState.CurrentPhase, totalPhases = _aiFishState.TotalPhases }
+                : new { ok = true, active = false, phase = 0, totalPhases = 0 };
+        else
+            throw new InvalidOperationException($"Unknown ai-fish action: {action}");
+    }
+
+    private object AiFishCast(Dictionary<string, object>? p)
+    {
+        if (_aiFishState != null)
+            return new { ok = false, error = "Already fishing! Use action='decide' to continue or wait for result." };
+
+        var tcs = new TaskCompletionSource<object>();
+        int diffParam = p != null && p.ContainsKey("difficulty") ? GetParam<int>(p, "difficulty") : -1;
+
+        EnqueueMainThread(() =>
+        {
+            try
+            {
+                var farmer = Game1.player;
+                if (!Context.IsWorldReady)
+                    throw new InvalidOperationException("World not ready");
+
+                // Detect rod
+                int rodLevel = 0; // 0=bamboo, 1=training, 2=fiberglass, 3=iridium
+                string rodName = "Bamboo Pole";
+                if (farmer.CurrentTool is FishingRod rod)
+                {
+                    rodName = rod.Name ?? "Bamboo Pole";
+                    if (rodName.Contains("Training")) rodLevel = 1;
+                    else if (rodName.Contains("Iridium")) rodLevel = 3;
+                    else if (rodName.Contains("Fiberglass")) rodLevel = 2;
+                    else if (rod.UpgradeLevel >= 3) rodLevel = 3;
+                    else if (rod.UpgradeLevel >= 2) rodLevel = 2;
+                    else if (rod.UpgradeLevel >= 1) rodLevel = 2;
+                }
+
+                // Detect tackle and bait
+                string tackleName = "none";
+                string baitName = "none";
+                if (farmer.CurrentTool is FishingRod fishRod)
+                {
+                    var baitObj = fishRod.GetBait();
+                    if (baitObj != null)
+                    {
+                        var bn = baitObj.Name?.ToLower() ?? "";
+                        if (bn.Contains("challenge")) baitName = "challenge";
+                        else if (bn.Contains("deluxe")) baitName = "deluxe";
+                        else if (bn.Contains("wild")) baitName = "wild";
+                        else if (bn.Contains("magnet")) baitName = "magnet";
+                        else baitName = "basic";
+                    }
+                    var tackleList = fishRod.GetTackle();
+                    if (tackleList != null)
+                    {
+                        foreach (var tack in tackleList)
+                        {
+                            if (tack == null) continue;
+                            var tn = tack.Name?.ToLower() ?? "";
+                            if (tn.Contains("cork")) { tackleName = "cork_bobber"; break; }
+                            else if (tn.Contains("lead")) { tackleName = "lead_bobber"; break; }
+                            else if (tn.Contains("trap")) { tackleName = "trap_bobber"; break; }
+                            else if (tn.Contains("barbed")) { tackleName = "barbed_hook"; break; }
+                            else if (tn.Contains("dressed")) { tackleName = "dressed_spinner"; break; }
+                            else if (tn.Contains("curiosity")) { tackleName = "curiosity_lure"; break; }
+                            else { tackleName = "other"; break; }
+                        }
+                    }
+                }
+
+                // Determine difficulty
+                int diff;
+                if (diffParam >= 0)
+                {
+                    diff = Math.Clamp(diffParam, 5, 120);
+                }
+                else
+                {
+                    int fishLevel = farmer.FishingLevel;
+                    var rng = Game1.random;
+                    diff = Math.Clamp(fishLevel * 7 + rng.Next(10, 35), 15, 110);
+                }
+
+                // Rod stats: (tensionMax, progressMult)
+                double tensionMax, progressMult;
+                switch (rodLevel)
+                {
+                    case 0: tensionMax = 60; progressMult = 0.75; break;
+                    case 1: tensionMax = 70; progressMult = 0.85; break;
+                    case 2: tensionMax = 78; progressMult = 1.0; break;
+                    default: tensionMax = 92; progressMult = 1.12; break;
+                }
+
+                // Tackle bonuses
+                double progressBonus = 0, tensionResist = 0, lossReduce = 0;
+                switch (tackleName)
+                {
+                    case "cork_bobber": progressBonus = 0.12; break;
+                    case "lead_bobber": tensionResist = 0.2; break;
+                    case "trap_bobber": lossReduce = 0.35; break;
+                    case "barbed_hook": progressBonus = 0.18; tensionResist = -0.05; break;
+                }
+
+                // Bait bonuses
+                double startBonus = 0, clueBonus = 0;
+                switch (baitName)
+                {
+                    case "basic": startBonus = 5; break;
+                    case "wild": startBonus = 3; clueBonus = 0.05; break;
+                    case "deluxe": startBonus = 8; break;
+                    case "challenge": startBonus = -10; clueBonus = -0.1; break;
+                }
+
+                // Phases based on difficulty
+                int phases;
+                if (diff <= 25) phases = 2;
+                else if (diff <= 50) phases = 3;
+                else if (diff <= 75) phases = 4;
+                else phases = 5;
+
+                // Generate fish pattern
+                var rng2 = new Random();
+                int patIdx = rng2.Next(AiFishPatterns.Length);
+                double noise = Math.Min(0.4, diff / 250.0);
+                var seq = new string[phases];
+                var pat = AiFishPatterns[patIdx];
+                for (int i = 0; i < phases; i++)
+                {
+                    seq[i] = pat[i % pat.Length];
+                    if (rng2.NextDouble() < noise)
+                    {
+                        var behaviors = new[] { "calm", "struggle", "rush", "dive" };
+                        seq[i] = behaviors[rng2.Next(behaviors.Length)];
+                    }
+                }
+
+                double startProgress = Math.Max(15, 40 - diff * 0.22) + startBonus;
+
+                var state = new AiFishState
+                {
+                    Difficulty = diff,
+                    TotalPhases = phases,
+                    CurrentPhase = 0,
+                    Progress = startProgress,
+                    Tension = 12,
+                    TensionMax = tensionMax,
+                    ProgressMult = progressMult,
+                    LossReduce = lossReduce,
+                    TensionResist = tensionResist,
+                    ProgressBonus = progressBonus,
+                    ClueBonus = clueBonus,
+                    PatternIdx = patIdx,
+                    BehaviorSeq = seq,
+                    History = new List<object>(),
+                    Rng = rng2,
+                    RodName = rodName,
+                    TackleName = tackleName,
+                    BaitName = baitName,
+                };
+                _aiFishState = state;
+
+                // Generate first phase clue
+                var firstBehavior = seq[0];
+                double acc = AiFishClueAccuracy(diff, 0, phases) + clueBonus;
+                string clue;
+                if (rng2.NextDouble() < acc)
+                    clue = AiFishClues[firstBehavior];
+                else
+                {
+                    var others = AiFishClues.Keys.Where(k => k != firstBehavior).ToArray();
+                    clue = AiFishClues[others[rng2.Next(others.Length)]];
+                }
+
+                string diffLabel = diff <= 25 ? "easy" : diff <= 50 ? "medium" : diff <= 75 ? "hard" : diff <= 95 ? "very_hard" : "legendary";
+
+                tcs.SetResult(new
+                {
+                    ok = true,
+                    status = "fishing",
+                    phase = 1,
+                    totalPhases = phases,
+                    difficulty = diff,
+                    difficultyLabel = diffLabel,
+                    patternHint = diff <= 40 ? AiFishPatternNames[patIdx] : "???",
+                    rod = rodName,
+                    tackle = tackleName,
+                    bait = baitName,
+                    clue,
+                    progress = Math.Round(state.Progress, 1),
+                    tension = Math.Round(state.Tension, 1),
+                    tensionMax = state.TensionMax,
+                    message = $"鱼咬钩了！难度:{diffLabel} | 阶段:1/{phases}"
+                });
+            }
+            catch (Exception ex)
+            {
+                tcs.SetResult(new { ok = false, error = ex.Message });
+            }
+        });
+        return tcs.Task.GetAwaiter().GetResult();
+    }
+
+    private object AiFishDecide(Dictionary<string, object>? p)
+    {
+        var state = _aiFishState;
+        if (state == null)
+            return new { ok = false, error = "No active fishing session. Use action='cast' first." };
+
+        string choice = p != null ? GetParamOr(p, "choice", "") : "";
+        if (choice != "reel" && choice != "release" && choice != "steady")
+            return new { ok = false, error = "Invalid choice. Use 'reel', 'release', or 'steady'." };
+
+        int phase = state.CurrentPhase;
+        if (phase >= state.TotalPhases)
+        {
+            _aiFishState = null;
+            return new { ok = false, error = "Fishing session already ended." };
+        }
+
+        var rng = state.Rng;
+        string behavior = state.BehaviorSeq[phase];
+        double strug = AiFishStruggle(state.Difficulty, phase, state.TotalPhases, rng);
+        double s = strug / 5.0;
+
+        // Calculate effects
+        double dp = 0, dt = 0;
+        if (choice == "reel")
+        {
+            switch (behavior)
+            {
+                case "calm": dp = 22 + rng.Next(-3, 6); dt = (4 + rng.Next(-1, 3)) * s; break;
+                case "struggle": dp = 5 + rng.Next(-3, 4); dt = (17 + rng.Next(-2, 5)) * s; break;
+                case "rush": dp = 2 + rng.Next(-4, 3); dt = (24 + rng.Next(-2, 7)) * s; break;
+                case "dive": dp = 8 + rng.Next(-3, 4); dt = (11 + rng.Next(-1, 4)) * s; break;
+            }
+        }
+        else if (choice == "release")
+        {
+            switch (behavior)
+            {
+                case "calm": dp = -11 + rng.Next(-2, 2); dt = -10 + rng.Next(-2, 2); break;
+                case "struggle": dp = -6 + rng.Next(-2, 2); dt = -9 + rng.Next(-1, 2); break;
+                case "rush": dp = -3 + rng.Next(-1, 2); dt = -17 + rng.Next(-2, 2); break;
+                case "dive": dp = -13 + rng.Next(-3, 1); dt = -5 + rng.Next(-1, 2); break;
+            }
+        }
+        else // steady
+        {
+            switch (behavior)
+            {
+                case "calm": dp = 6 + rng.Next(-1, 3); dt = -3 + rng.Next(-1, 2); break;
+                case "struggle": dp = 12 + rng.Next(-2, 4); dt = (5 + rng.Next(-1, 3)) * s; break;
+                case "rush": dp = 4 + rng.Next(-2, 3); dt = (9 + rng.Next(-1, 4)) * s; break;
+                case "dive": dp = 14 + rng.Next(-2, 5); dt = (3 + rng.Next(-1, 3)) * s; break;
+            }
+        }
+
+        // Apply equipment bonuses
+        if (dp > 0)
+            dp = dp * state.ProgressMult * (1 + state.ProgressBonus);
+        else
+            dp = dp * (1 - state.LossReduce);
+
+        if (dt > 0)
+            dt = dt * (1 - state.TensionResist);
+
+        state.Progress = Math.Clamp(state.Progress + dp, 0, 100);
+        state.Tension = Math.Clamp(state.Tension + dt, 0, 100);
+
+        // Determine if choice was optimal
+        string optimal;
+        switch (behavior)
+        {
+            case "calm": optimal = "reel"; break;
+            case "struggle": optimal = "steady"; break;
+            case "rush": optimal = "release"; break;
+            default: optimal = "steady"; break;
+        }
+        string quality = choice == optimal ? "perfect" : "ok";
+        if ((behavior == "rush" && choice == "reel") || (behavior == "calm" && choice == "release") || (behavior == "dive" && choice == "release"))
+            quality = "bad";
+
+        state.History.Add(new
+        {
+            phase = phase + 1,
+            choice,
+            actualBehavior = behavior,
+            quality,
+            progressDelta = Math.Round(dp, 1),
+            tensionDelta = Math.Round(dt, 1),
+            progress = Math.Round(state.Progress, 1),
+            tension = Math.Round(state.Tension, 1),
+        });
+
+        state.CurrentPhase++;
+
+        // Check end conditions
+        string? result = null;
+        string? endMessage = null;
+        string? taunt = null;
+
+        if (state.Tension >= state.TensionMax)
+        {
+            result = "snap";
+            taunt = AiFishTaunts[rng.Next(AiFishTaunts.Length)];
+            endMessage = $"💥 线断了！{taunt}";
+        }
+        else if (state.Progress >= 100)
+        {
+            result = "caught";
+            endMessage = "🐟 钓到了！";
+        }
+        else if (state.Progress <= 0)
+        {
+            result = "escaped";
+            taunt = AiFishTaunts[rng.Next(AiFishTaunts.Length)];
+            endMessage = $"鱼跑了...{taunt}";
+        }
+        else if (state.CurrentPhase >= state.TotalPhases)
+        {
+            if (state.Progress >= 55)
+            {
+                result = "caught";
+                endMessage = "🐟 鱼精疲力竭，钓到了！";
+            }
+            else
+            {
+                result = "escaped";
+                taunt = AiFishTaunts[rng.Next(AiFishTaunts.Length)];
+                endMessage = $"进度不足，鱼挣脱了...{taunt}";
+            }
+        }
+
+        if (result != null)
+        {
+            // Fishing ended
+            bool caught = result == "caught";
+            var finalResult = new
+            {
+                ok = true,
+                status = "finished",
+                result,
+                message = endMessage,
+                taunt,
+                caught,
+                difficulty = state.Difficulty,
+                pattern = AiFishPatternNames[state.PatternIdx],
+                finalProgress = Math.Round(state.Progress, 1),
+                finalTension = Math.Round(state.Tension, 1),
+                phases = state.CurrentPhase,
+                history = state.History,
+            };
+
+            // Give fishing XP if caught
+            if (caught)
+            {
+                EnqueueMainThread(() =>
+                {
+                    var xp = Math.Max(3, state.Difficulty / 8);
+                    Game1.player.gainExperience(1, xp); // 1 = fishing skill
+                });
+            }
+
+            _aiFishState = null;
+            return finalResult;
+        }
+
+        // Generate next phase clue
+        int nextPhase = state.CurrentPhase;
+        string nextBehavior = state.BehaviorSeq[nextPhase];
+        double nextAcc = AiFishClueAccuracy(state.Difficulty, nextPhase, state.TotalPhases) + state.ClueBonus;
+        string nextClue;
+        if (rng.NextDouble() < nextAcc)
+            nextClue = AiFishClues[nextBehavior];
+        else
+        {
+            var others = AiFishClues.Keys.Where(k => k != nextBehavior).ToArray();
+            nextClue = AiFishClues[others[rng.Next(others.Length)]];
+        }
+
+        return new
+        {
+            ok = true,
+            status = "ongoing",
+            phase = nextPhase + 1,
+            totalPhases = state.TotalPhases,
+            lastChoice = choice,
+            lastBehavior = behavior,
+            lastQuality = quality,
+            clue = nextClue,
+            progress = Math.Round(state.Progress, 1),
+            tension = Math.Round(state.Tension, 1),
+            tensionMax = state.TensionMax,
+            history = state.History,
+            message = $"阶段{nextPhase + 1}/{state.TotalPhases} | 进度:{Math.Round(state.Progress, 1)}% 张力:{Math.Round(state.Tension, 1)}/{state.TensionMax}"
+        };
+    }
+
+    private static double AiFishClueAccuracy(int diff, int phase, int total)
+    {
+        double baseAcc = Math.Max(0.35, 1.0 - diff / 150.0);
+        if (phase < 2)
+            return Math.Min(0.92, baseAcc + 0.25);
+        double decay = (phase - 1) * 0.08;
+        return Math.Max(0.25, baseAcc - decay);
+    }
+
+    private static double AiFishStruggle(int diff, int phase, int total, Random rng)
+    {
+        double baseVal = diff / 10.0;
+        double phaseFactor = total > 1 ? (double)phase / (total - 1) : 0;
+        return Math.Clamp(baseVal + (rng.NextDouble() * 3.0 - 1.5) + phaseFactor * 2.5, 1, 10);
     }
 
     /// <summary>
