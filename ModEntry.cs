@@ -724,6 +724,7 @@ public class ModEntry : Mod
                 "/festival/answer" => HandleFestivalAnswer(ctx),
                 "/chat/push" => HandleChatPush(ctx),
                 "/chat/history" => HandleChatHistory(),
+                "/cast" => HandleCast(ctx),
                 _ => throw new InvalidOperationException($"Unknown endpoint: {path}")
             };
 
@@ -973,6 +974,170 @@ public class ModEntry : Mod
     {
         // Returns empty if chatHud not initialized - safe fallback
         return new { ok = true, messages = Array.Empty<object>() };
+    }
+
+    /// <summary>
+    /// POST /cast  { "count": 3, "radius": 5 }
+    /// Remote "staff" attack: scans for monsters within radius, deals weapon damage
+    /// without needing to be adjacent. Simulates ranged combat for API-controlled players.
+    /// Weapon stats are derived from currently equipped weapon (or best weapon in inventory).
+    /// </summary>
+    private object HandleCast(HttpListenerContext ctx)
+    {
+        var p = ReadJson(ctx);
+        var count = GetParamOr(p, "count", 1);
+        var radius = GetParamOr(p, "radius", -1);
+
+        if (!Context.IsWorldReady)
+            throw new InvalidOperationException("World not ready");
+
+        if (count < 1) count = 1;
+        if (count > 10) count = 10;
+
+        var tcs = new TaskCompletionSource<object>();
+        EnqueueMainThread(() =>
+        {
+            try
+            {
+                var farmer = Game1.player;
+                var loc = farmer.currentLocation;
+                var cx = farmer.TilePoint.X;
+                var cy = farmer.TilePoint.Y;
+
+                // Find equipped weapon or best weapon in inventory
+                StardewValley.Tools.MeleeWeapon? weapon = farmer.CurrentTool as StardewValley.Tools.MeleeWeapon;
+                if (weapon == null)
+                {
+                    foreach (var item in farmer.Items)
+                    {
+                        if (item is StardewValley.Tools.MeleeWeapon w)
+                        {
+                            if (weapon == null || w.minDamage.Value > weapon.minDamage.Value)
+                                weapon = w;
+                        }
+                    }
+                }
+
+                if (weapon == null)
+                {
+                    tcs.SetResult(new { ok = false, error = "No weapon found in inventory" });
+                    return;
+                }
+
+                int baseDmgMin = weapon.minDamage.Value;
+                int baseDmgMax = weapon.maxDamage.Value;
+                string weaponName = weapon.DisplayName ?? weapon.Name;
+
+                // Determine effective radius based on weapon level
+                if (radius < 0)
+                {
+                    int weaponLevel = weapon.getItemLevel();
+                    radius = Math.Min(3 + weaponLevel, 12);
+                }
+
+                var kills = new List<object>();
+                var hits = new List<object>();
+                int totalDamageDealt = 0;
+                int damageTaken = 0;
+                int staminaCost = 0;
+
+                for (int i = 0; i < count; i++)
+                {
+                    // Find nearest monster within radius
+                    Monster? target = null;
+                    double minDist = double.MaxValue;
+                    foreach (var npc in loc.characters)
+                    {
+                        if (npc is Monster m && m.Health > 0)
+                        {
+                            double dist = Math.Sqrt(Math.Pow(m.TilePoint.X - cx, 2) + Math.Pow(m.TilePoint.Y - cy, 2));
+                            if (dist <= radius && dist < minDist)
+                            {
+                                minDist = dist;
+                                target = m;
+                            }
+                        }
+                    }
+
+                    if (target == null) break;
+
+                    // Calculate damage with some randomness
+                    var rng = Game1.random;
+                    int dmg = rng.Next(baseDmgMin, baseDmgMax + 1);
+                    bool crit = rng.NextDouble() < 0.05 + farmer.critChance.Value;
+                    if (crit) dmg = (int)(dmg * (2.0 + farmer.critPower.Value));
+
+                    // Apply damage
+                    int prevHp = target.Health;
+                    target.Health -= dmg;
+                    totalDamageDealt += dmg;
+                    staminaCost += 2;
+
+                    // Monster counter-attack chance (distance-based)
+                    double counterChance = Math.Max(0, 0.4 - minDist * 0.06);
+                    if (rng.NextDouble() < counterChance)
+                    {
+                        int monsterDmg = Math.Max(1, target.DamageToFarmer - farmer.resilience.Value);
+                        farmer.health = Math.Max(1, farmer.health - monsterDmg);
+                        damageTaken += monsterDmg;
+                    }
+
+                    bool killed = target.Health <= 0;
+                    var hitInfo = new
+                    {
+                        monster = target.Name,
+                        distance = Math.Round(minDist, 1),
+                        damage = dmg,
+                        critical = crit,
+                        monsterHpLeft = Math.Max(0, target.Health),
+                        killed
+                    };
+
+                    if (killed)
+                    {
+                        kills.Add(hitInfo);
+                        // Remove dead monster and grant XP
+                        loc.characters.Remove(target);
+                        farmer.gainExperience(4, target.ExperienceGained); // combat skill
+                    }
+                    else
+                    {
+                        hits.Add(hitInfo);
+                    }
+                }
+
+                // Deduct stamina
+                farmer.Stamina = Math.Max(0, farmer.Stamina - staminaCost);
+
+                // Scan remaining monsters
+                var remaining = loc.characters
+                    .OfType<Monster>()
+                    .Where(m => m.Health > 0 && Math.Sqrt(Math.Pow(m.TilePoint.X - cx, 2) + Math.Pow(m.TilePoint.Y - cy, 2)) <= radius)
+                    .Select(m => new { name = m.Name, x = m.TilePoint.X, y = m.TilePoint.Y, health = m.Health, distance = Math.Round(Math.Sqrt(Math.Pow(m.TilePoint.X - cx, 2) + Math.Pow(m.TilePoint.Y - cy, 2)), 1) })
+                    .ToList();
+
+                tcs.SetResult(new
+                {
+                    ok = true,
+                    weapon = weaponName,
+                    effectiveRadius = radius,
+                    casts = hits.Count + kills.Count,
+                    hits,
+                    kills,
+                    totalDamageDealt,
+                    damageTaken,
+                    staminaCost,
+                    playerHealth = farmer.health,
+                    playerStamina = (int)farmer.Stamina,
+                    monstersInRange = remaining
+                });
+            }
+            catch (Exception ex)
+            {
+                tcs.SetResult(new { ok = false, error = ex.Message });
+            }
+        });
+        return tcs.Task.GetAwaiter().GetResult();
     }
 
     /// <summary>
@@ -1699,8 +1864,21 @@ public class ModEntry : Mod
                     return;
                 }
 
+                // Dynamically find bed position instead of hardcoding
                 var bedX = 10;
                 var bedY = 6;
+                if (homeLoc is StardewValley.Locations.FarmHouse fh)
+                {
+                    var bedSpot = fh.GetPlayerBedPosition();
+                    bedX = (int)(bedSpot.X / 64);
+                    bedY = (int)(bedSpot.Y / 64);
+                }
+                else if (homeLoc is StardewValley.Locations.Cabin cab)
+                {
+                    var bedSpot = cab.GetPlayerBedPosition();
+                    bedX = (int)(bedSpot.X / 64);
+                    bedY = (int)(bedSpot.Y / 64);
+                }
 
                 var needsWarp = farmer.currentLocation.Name != homeLoc.Name;
                 if (needsWarp)
