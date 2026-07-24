@@ -1311,10 +1311,10 @@ public class ModEntry : Mod
                 double tensionMax, progressMult;
                 switch (rodLevel)
                 {
-                    case 0: tensionMax = 60; progressMult = 0.75; break;
-                    case 1: tensionMax = 70; progressMult = 0.85; break;
-                    case 2: tensionMax = 78; progressMult = 1.0; break;
-                    default: tensionMax = 92; progressMult = 1.12; break;
+                    case 0: tensionMax = 78; progressMult = 0.98; break;
+                    case 1: tensionMax = 82; progressMult = 1.04; break;
+                    case 2: tensionMax = 90; progressMult = 1.10; break;
+                    default: tensionMax = 100; progressMult = 1.18; break;
                 }
 
                 // Tackle bonuses
@@ -1344,9 +1344,39 @@ public class ModEntry : Mod
                 else if (diff <= 75) phases = 4;
                 else phases = 5;
 
-                // Generate fish pattern
+                // Generate fish pattern (weighted by difficulty)
                 var rng2 = new Random();
-                int patIdx = rng2.Next(AiFishPatterns.Length);
+                // Groups: A=stubborn(6,7) B=bait(10) C=pulse/spiral/zigzag(4,9,11) D=rest(0,1,2,3,5,8)
+                double roll = rng2.NextDouble() * 100;
+                int[] candidates;
+                if (diff <= 25)  // Easy: A=5% B=5% C=25% D=65%
+                {
+                    if (roll < 5) candidates = new[] {6, 7};
+                    else if (roll < 10) candidates = new[] {10};
+                    else if (roll < 35) candidates = new[] {4, 9, 11};
+                    else candidates = new[] {0, 1, 2, 3, 5, 8};
+                }
+                else if (diff <= 50)  // Medium: A=20% B=10% C=40% D=30%
+                {
+                    if (roll < 20) candidates = new[] {6, 7};
+                    else if (roll < 30) candidates = new[] {10};
+                    else if (roll < 70) candidates = new[] {4, 9, 11};
+                    else candidates = new[] {0, 1, 2, 3, 5, 8};
+                }
+                else if (diff <= 75)  // Hard: A=35% B=20% C=20% D=25%
+                {
+                    if (roll < 35) candidates = new[] {6, 7};
+                    else if (roll < 55) candidates = new[] {10};
+                    else if (roll < 75) candidates = new[] {4, 9, 11};
+                    else candidates = new[] {0, 1, 2, 3, 5, 8};
+                }
+                else  // Legend: A=60% B=25% C=15% D=0%
+                {
+                    if (roll < 60) candidates = new[] {6, 7};
+                    else if (roll < 85) candidates = new[] {10};
+                    else candidates = new[] {4, 9, 11};
+                }
+                int patIdx = candidates[rng2.Next(candidates.Length)];
                 double noise = Math.Min(0.4, diff / 250.0);
                 var seq = new string[phases];
                 var pat = AiFishPatterns[patIdx];
@@ -1360,7 +1390,24 @@ public class ModEntry : Mod
                     }
                 }
 
-                double startProgress = Math.Max(15, 40 - diff * 0.22) + startBonus;
+                // 逃跑概率（整次一次roll）
+                double escapeChance = diff <= 25 ? 0 : diff <= 50 ? 0.08 : diff <= 75 ? 0.15 : 0.20;
+                if (rng2.NextDouble() < escapeChance)
+                {
+                    tcs.SetResult(new
+                    {
+                        ok = true,
+                        status = "finished",
+                        result = "escaped",
+                        caught = false,
+                        difficulty = diff,
+                        message = "鱼咬钩后猛力挣脱，跑了！",
+                        taunt = AiFishTaunts[rng2.Next(AiFishTaunts.Length)]
+                    });
+                    return;
+                }
+
+                double startProgress = Math.Max(20, 55 - diff * 0.28) + startBonus;
 
                 var state = new AiFishState
                 {
@@ -1368,7 +1415,7 @@ public class ModEntry : Mod
                     TotalPhases = phases,
                     CurrentPhase = 0,
                     Progress = startProgress,
-                    Tension = 12,
+                    Tension = 10,
                     TensionMax = tensionMax,
                     ProgressMult = progressMult,
                     LossReduce = lossReduce,
@@ -1455,7 +1502,7 @@ public class ModEntry : Mod
             switch (behavior)
             {
                 case "calm": dp = 22 + rng.Next(-3, 6); dt = (4 + rng.Next(-1, 3)) * s; break;
-                case "struggle": dp = 5 + rng.Next(-3, 4); dt = (17 + rng.Next(-2, 5)) * s; break;
+                case "struggle": dp = 5 + rng.Next(-3, 4); dt = (18 + rng.Next(-2, 5)) * s; break;
                 case "rush": dp = 2 + rng.Next(-4, 3); dt = (24 + rng.Next(-2, 7)) * s; break;
                 case "dive": dp = 8 + rng.Next(-3, 4); dt = (11 + rng.Next(-1, 4)) * s; break;
             }
@@ -1475,7 +1522,7 @@ public class ModEntry : Mod
             switch (behavior)
             {
                 case "calm": dp = 6 + rng.Next(-1, 3); dt = -3 + rng.Next(-1, 2); break;
-                case "struggle": dp = 12 + rng.Next(-2, 4); dt = (5 + rng.Next(-1, 3)) * s; break;
+                case "struggle": dp = 10 + rng.Next(-2, 4); dt = (9 + rng.Next(-1, 3)) * s; break;
                 case "rush": dp = 4 + rng.Next(-2, 3); dt = (9 + rng.Next(-1, 4)) * s; break;
                 case "dive": dp = 14 + rng.Next(-2, 5); dt = (3 + rng.Next(-1, 3)) * s; break;
             }
@@ -1544,16 +1591,50 @@ public class ModEntry : Mod
         }
         else if (state.CurrentPhase >= state.TotalPhases)
         {
-            if (state.Progress >= 55)
+            if (state.Difficulty > 75)
             {
-                result = "caught";
-                endMessage = "🐟 鱼精疲力竭，钓到了！";
+                // 传说鱼第6阶段：鱼王决死
+                if (state.Progress < 30)
+                {
+                    result = "escaped";
+                    taunt = AiFishTaunts[rng.Next(AiFishTaunts.Length)];
+                    endMessage = $"进度太低，鱼王直接逃走了...{taunt}";
+                }
+                else
+                {
+                    // 3次猜2次对。一代(diff>100)准确率25%，二代(diff<=100)准确率37%
+                    double aiAcc = state.Difficulty > 100 ? 0.25 : 0.37;
+                    int correct = 0;
+                    for (int i = 0; i < 3; i++)
+                        if (rng.NextDouble() < aiAcc) correct++;
+
+                    if (correct >= 2)
+                    {
+                        result = "caught";
+                        endMessage = $"🐟🏆 鱼王决死（{correct}/3）！传说之鱼到手！";
+                    }
+                    else
+                    {
+                        result = "escaped";
+                        taunt = AiFishTaunts[rng.Next(AiFishTaunts.Length)];
+                        endMessage = $"鱼王决死失败（{correct}/3）...{taunt}";
+                    }
+                }
             }
             else
             {
-                result = "escaped";
-                taunt = AiFishTaunts[rng.Next(AiFishTaunts.Length)];
-                endMessage = $"进度不足，鱼挣脱了...{taunt}";
+                double threshold = state.Difficulty <= 50 ? 50 : 55;
+                if (state.Progress >= threshold)
+                {
+                    result = "caught";
+                    endMessage = "🐟 鱼精疲力竭，钓到了！";
+                }
+                else
+                {
+                    result = "escaped";
+                    taunt = AiFishTaunts[rng.Next(AiFishTaunts.Length)];
+                    endMessage = $"进度不足，鱼挣脱了...{taunt}";
+                }
             }
         }
 
@@ -1624,11 +1705,11 @@ public class ModEntry : Mod
 
     private static double AiFishClueAccuracy(int diff, int phase, int total)
     {
-        double baseAcc = Math.Max(0.35, 1.0 - diff / 150.0);
+        double baseAcc = Math.Max(0.32, 1.0 - diff / 145.0);
         if (phase < 2)
-            return Math.Min(0.92, baseAcc + 0.25);
-        double decay = (phase - 1) * 0.08;
-        return Math.Max(0.25, baseAcc - decay);
+            return Math.Min(0.94, baseAcc + 0.30);
+        double decay = (phase - 1) * 0.09;
+        return Math.Max(0.22, baseAcc - decay);
     }
 
     private static double AiFishStruggle(int diff, int phase, int total, Random rng)
