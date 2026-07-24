@@ -32,22 +32,26 @@ if (-not $GamePath) {
 }
 Write-Host "Found game: $GamePath" -ForegroundColor Green
 
-# 2. Setup working directory
-$workDir = "$env:TEMP\nagi-build"
-if (Test-Path $workDir) { Remove-Item $workDir -Recurse -Force }
+# 2. Setup working directory (use timestamp to avoid locked file issues)
+$workDir = "$env:TEMP\nagi-build-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
 New-Item -ItemType Directory -Path $workDir -Force | Out-Null
 
-# 3. Download .NET SDK (portable, no install needed)
-$dotnetDir = "$workDir\dotnet"
-Write-Host "Downloading .NET SDK..." -ForegroundColor Cyan
-$sdkUrl = "https://builds.dotnet.microsoft.com/dotnet/Sdk/8.0.423/dotnet-sdk-8.0.423-win-x64.zip"
-$sdkZip = "$workDir\dotnet-sdk.zip"
-Invoke-WebRequest -Uri $sdkUrl -OutFile $sdkZip -UseBasicParsing
-Expand-Archive -Path $sdkZip -DestinationPath $dotnetDir
+# 3. Download .NET SDK (reuse if recent build exists, otherwise download)
+$dotnetDir = "$env:TEMP\nagi-dotnet-sdk"
+if (-not (Test-Path "$dotnetDir\dotnet.exe")) {
+    Write-Host "Downloading .NET SDK (first time only, ~200MB)..." -ForegroundColor Cyan
+    $sdkUrl = "https://builds.dotnet.microsoft.com/dotnet/Sdk/8.0.423/dotnet-sdk-8.0.423-win-x64.zip"
+    $sdkZip = "$workDir\dotnet-sdk.zip"
+    Invoke-WebRequest -Uri $sdkUrl -OutFile $sdkZip -UseBasicParsing
+    Expand-Archive -Path $sdkZip -DestinationPath $dotnetDir
+    Write-Host "SDK downloaded!" -ForegroundColor Green
+} else {
+    Write-Host "Using cached .NET SDK" -ForegroundColor Green
+}
 $env:PATH = "$dotnetDir;$env:PATH"
 $env:DOTNET_CLI_HOME = "$workDir\dotnet-home"
 $env:DOTNET_CLI_TELEMETRY_OPTOUT = "1"
-Write-Host "SDK ready: $(& "$dotnetDir\dotnet.exe" --version)" -ForegroundColor Green
+Write-Host "SDK version: $(& "$dotnetDir\dotnet.exe" --version)" -ForegroundColor Green
 
 # 4. Download NagiBridge source (from your fork)
 Write-Host "Downloading NagiBridge source..." -ForegroundColor Cyan
@@ -94,3 +98,5 @@ Write-Host "Restart Stardew Valley to use the new version." -ForegroundColor Gre
 Write-Host "`nNew features:" -ForegroundColor Cyan
 Write-Host "  - /cast endpoint (ranged staff attack)" -ForegroundColor White
 Write-Host "  - Sleep fix (dynamic bed position for Cabin)" -ForegroundColor White
+Write-Host ""
+Read-Host "Press Enter to close"
