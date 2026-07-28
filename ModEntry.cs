@@ -1230,6 +1230,9 @@ public class ModEntry : Mod
         public string RodName = "";
         public string TackleName = "";
         public string BaitName = "";
+        public string? FishId;      // real fish rolled from location pool; null = practice mode
+        public string? FishName;
+        public int PerfectCount;
     }
 
     private AiFishState? _aiFishState;
@@ -1314,18 +1317,66 @@ public class ModEntry : Mod
                     }
                 }
 
+                // Real-fish mode (default): roll a fish from this location's pool,
+                // use its actual difficulty. Passing "difficulty" switches to practice
+                // mode: old behavior, no real fish awarded.
+                string? fishId = null;
+                string? fishName = null;
+                int realFishDiff = -1;
+                if (diffParam < 0)
+                {
+                    if (farmer.CurrentTool is not FishingRod)
+                    {
+                        tcs.SetResult(new { ok = false, error = "Need a fishing rod equipped — use /select first" });
+                        return;
+                    }
+
+                    var loc = farmer.currentLocation;
+                    var ft = farmer.TilePoint;
+                    Vector2? waterTile = null;
+                    for (int r = 1; r <= 8 && waterTile == null; r++)
+                    {
+                        for (int dx = -r; dx <= r && waterTile == null; dx++)
+                        for (int dy = -r; dy <= r && waterTile == null; dy++)
+                        {
+                            if (Math.Max(Math.Abs(dx), Math.Abs(dy)) != r) continue;
+                            if (loc.isWaterTile(ft.X + dx, ft.Y + dy))
+                                waterTile = new Vector2(ft.X + dx, ft.Y + dy);
+                        }
+                    }
+                    if (waterTile == null)
+                    {
+                        tcs.SetResult(new { ok = false, error = "No water within 8 tiles — walk to a shore, river or pond first" });
+                        return;
+                    }
+
+                    var rolled = loc.getFish(0f, null, 4, farmer, 0.0, waterTile.Value);
+                    if (rolled == null)
+                    {
+                        tcs.SetResult(new { ok = false, error = "Nothing is biting here, try another spot" });
+                        return;
+                    }
+
+                    var fishData = Game1.content.Load<Dictionary<string, string>>("Data\\Fish");
+                    var fields = fishData.TryGetValue(rolled.ItemId, out var rawFish) ? rawFish.Split('/') : null;
+                    if (fields == null || fields.Length < 3 || !int.TryParse(fields[1], out realFishDiff))
+                    {
+                        // junk / algae / non-fish: no minigame, straight to inventory
+                        farmer.addItemByMenuIfNecessary(rolled);
+                        tcs.SetResult(new { ok = true, status = "junk", caught = true, fish = rolled.DisplayName,
+                            message = $"钓上来一个 {rolled.DisplayName}……不是鱼，直接进包了" });
+                        return;
+                    }
+                    fishId = rolled.QualifiedItemId;
+                    fishName = rolled.DisplayName;
+                }
+
                 // Determine difficulty
                 int diff;
                 if (diffParam >= 0)
-                {
                     diff = Math.Clamp(diffParam, 5, 120);
-                }
                 else
-                {
-                    int fishLevel = farmer.FishingLevel;
-                    var rng = Game1.random;
-                    diff = Math.Clamp(fishLevel * 7 + rng.Next(10, 35), 15, 110);
-                }
+                    diff = Math.Clamp(realFishDiff, 5, 120);
 
                 // Rod stats: (tensionMax, progressMult)
                 double tensionMax, progressMult;
@@ -1421,7 +1472,8 @@ public class ModEntry : Mod
                         result = "escaped",
                         caught = false,
                         difficulty = diff,
-                        message = "鱼咬钩后猛力挣脱，跑了！",
+                        fishEscaped = fishName,
+                        message = fishName != null ? $"鱼咬钩后猛力挣脱，跑了！好像是一条{fishName}……" : "鱼咬钩后猛力挣脱，跑了！",
                         taunt = AiFishTaunts[rng2.Next(AiFishTaunts.Length)]
                     });
                     return;
@@ -1449,6 +1501,8 @@ public class ModEntry : Mod
                     RodName = rodName,
                     TackleName = tackleName,
                     BaitName = baitName,
+                    FishId = fishId,
+                    FishName = fishName,
                 };
                 _aiFishState = state;
 
@@ -1572,6 +1626,7 @@ public class ModEntry : Mod
         string quality = choice == optimal ? "perfect" : "ok";
         if ((behavior == "rush" && choice == "reel") || (behavior == "calm" && choice == "release") || (behavior == "dive" && choice == "release"))
             quality = "bad";
+        if (quality == "perfect") state.PerfectCount++;
 
         state.History.Add(new
         {
@@ -1662,6 +1717,20 @@ public class ModEntry : Mod
         {
             // Fishing ended
             bool caught = result == "caught";
+
+            // Quality from play: all perfect = gold, half+ = silver
+            int fishQuality = 0;
+            if (caught && state.CurrentPhase > 0)
+            {
+                if (state.PerfectCount >= state.CurrentPhase) fishQuality = 2;
+                else if (state.PerfectCount * 2 >= state.CurrentPhase) fishQuality = 1;
+            }
+
+            if (caught && state.FishName != null)
+                endMessage = $"🐟 钓到了一条{state.FishName}！" + (fishQuality == 2 ? "全程完美，金星品质！" : fishQuality == 1 ? "银星品质" : "");
+            else if (!caught && state.FishName != null)
+                endMessage += $"（跑掉的好像是一条{state.FishName}）";
+
             var finalResult = new
             {
                 ok = true,
@@ -1670,6 +1739,8 @@ public class ModEntry : Mod
                 message = endMessage,
                 taunt,
                 caught,
+                fish = state.FishName,
+                quality = caught ? fishQuality : (int?)null,
                 difficulty = state.Difficulty,
                 pattern = AiFishPatternNames[state.PatternIdx],
                 finalProgress = Math.Round(state.Progress, 1),
@@ -1678,13 +1749,21 @@ public class ModEntry : Mod
                 history = state.History,
             };
 
-            // Give fishing XP if caught
+            // Award XP and the real fish if caught
             if (caught)
             {
+                var fishId = state.FishId;
                 EnqueueMainThread(() =>
                 {
                     var xp = Math.Max(3, state.Difficulty / 8);
                     Game1.player.gainExperience(1, xp); // 1 = fishing skill
+                    if (fishId != null)
+                    {
+                        var fish = ItemRegistry.Create(fishId, 1);
+                        if (fish is StardewValley.Object fo)
+                            fo.Quality = fishQuality;
+                        Game1.player.addItemByMenuIfNecessary(fish);
+                    }
                 });
             }
 
