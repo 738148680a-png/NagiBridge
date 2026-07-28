@@ -701,6 +701,7 @@ public class ModEntry : Mod
                 "/pause" => HandlePause(),
                 "/resume" => HandleResume(),
                 "/give" => HandleGive(ctx),
+                "/toss" => HandleToss(ctx),
                 "/money" => HandleMoney(ctx),
                 "/refill" => HandleRefill(),
                 "/heal" => HandleHeal(),
@@ -846,13 +847,16 @@ public class ModEntry : Mod
     }
 
     /// <summary>
-    /// POST /tool  { "name": "Axe" } or { "name": "current" }
+    /// POST /tool  { "name": "Axe", "x": 12, "y": 34 }
     /// Swings the specified tool (or current tool) once.
+    /// Optional x/y: target tile — must be adjacent (or own tile); farmer auto-faces it before swinging.
     /// </summary>
     private object HandleTool(HttpListenerContext ctx)
     {
         var p = ReadJson(ctx);
         var name = GetParamOr(p, "name", "current");
+        var tx = GetParamOr(p, "x", -1);
+        var ty = GetParamOr(p, "y", -1);
 
         if (!Context.IsWorldReady)
             throw new InvalidOperationException("World not ready");
@@ -862,6 +866,20 @@ public class ModEntry : Mod
         EnqueueMainThread(() =>
         {
             var farmer = Game1.player;
+
+            if (tx >= 0 && ty >= 0)
+            {
+                var dx = tx - farmer.TilePoint.X;
+                var dy = ty - farmer.TilePoint.Y;
+                if (Math.Abs(dx) + Math.Abs(dy) > 1)
+                {
+                    tcs.SetResult(new { ok = false,
+                        error = $"Target ({tx},{ty}) is not adjacent — standing at ({farmer.TilePoint.X},{farmer.TilePoint.Y}). Move to a tile next to it first." });
+                    return;
+                }
+                if (dx != 0 || dy != 0)
+                    farmer.faceDirection(dx > 0 ? 1 : dx < 0 ? 3 : dy > 0 ? 2 : 0);
+            }
 
             if (name != "current")
             {
@@ -880,7 +898,9 @@ public class ModEntry : Mod
             }
 
             farmer.BeginUsingTool();
-            tcs.SetResult(new { ok = true, tool = farmer.CurrentTool?.Name ?? "none" });
+            var toolTile = GetFacingTile(farmer);
+            tcs.SetResult(new { ok = true, tool = farmer.CurrentTool?.Name ?? "none",
+                facing = farmer.FacingDirection, hitTile = new { x = (int)toolTile.X, y = (int)toolTile.Y } });
         });
 
         return tcs.Task.GetAwaiter().GetResult();
@@ -2459,29 +2479,49 @@ public class ModEntry : Mod
                     bedY = bedSpot.Y;
                 }
 
-                var needsWarp = farmer.currentLocation.Name != homeLoc.Name;
+                var needsWarp = farmer.currentLocation.NameOrUniqueName != homeLoc.NameOrUniqueName;
                 if (needsWarp)
                 {
-                    Game1.warpFarmer(homeName, bedX, bedY, false);
+                    // Cabins are building interiors (structures); a plain name warp
+                    // fails to resolve them and dumps the farmer at a garbage position
+                    Game1.warpFarmer(
+                        Game1.getLocationRequest(homeLoc.NameOrUniqueName, homeLoc.isStructure.Value),
+                        bedX, bedY, 2);
                 }
 
                 // Longer delay for farmhand warp sync
                 var delay = needsWarp ? 3000 : 500;
                 DelayedAction.functionAfterDelay(() =>
                 {
+                    // Verify the warp actually landed us home; retry once if it missed
                     var f = Game1.player;
-                    f.isInBed.Value = true;
-                    f.sleptInTemporaryBed.Value = false;
-                    f.currentLocation.answerDialogueAction("Sleep_Yes", Array.Empty<string>());
+                    if (f.currentLocation?.NameOrUniqueName != homeLoc.NameOrUniqueName)
+                    {
+                        Game1.warpFarmer(
+                            Game1.getLocationRequest(homeLoc.NameOrUniqueName, homeLoc.isStructure.Value),
+                            bedX, bedY, 2);
+                    }
 
                     DelayedAction.functionAfterDelay(() =>
                     {
-                        if (Game1.activeClickableMenu != null)
+                        var f2 = Game1.player;
+                        // isInBed only sticks if the farmer is physically on the bed tile
+                        if (Math.Abs(f2.TilePoint.X - bedX) > 1 || Math.Abs(f2.TilePoint.Y - bedY) > 1)
+                            f2.Position = new Vector2(bedX * 64f, bedY * 64f);
+
+                        f2.isInBed.Value = true;
+                        f2.sleptInTemporaryBed.Value = false;
+                        f2.currentLocation.answerDialogueAction("Sleep_Yes", Array.Empty<string>());
+
+                        DelayedAction.functionAfterDelay(() =>
                         {
-                            Game1.player.currentLocation.answerDialogueAction("Sleep_Yes", Array.Empty<string>());
-                            Game1.pressActionButton(Game1.input.GetKeyboardState(), Game1.input.GetMouseState(),
-                                Game1.input.GetGamePadState());
-                        }
+                            if (Game1.activeClickableMenu != null)
+                            {
+                                Game1.player.currentLocation.answerDialogueAction("Sleep_Yes", Array.Empty<string>());
+                                Game1.pressActionButton(Game1.input.GetKeyboardState(), Game1.input.GetMouseState(),
+                                    Game1.input.GetGamePadState());
+                            }
+                        }, 1000);
                     }, 1000);
                 }, delay);
 
@@ -3135,6 +3175,47 @@ public class ModEntry : Mod
             var item = ItemRegistry.Create(itemId, count);
             farmer.addItemToInventory(item);
             tcs.SetResult(new { ok = true, given = item.Name, count, id = itemId });
+        });
+        return tcs.Task.GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// POST /toss  { "name": "Wood", "count": 5 }
+    /// Drops items from inventory onto the ground in front of the farmer,
+    /// so another player can pick them up (multiplayer item hand-off).
+    /// </summary>
+    private object HandleToss(HttpListenerContext ctx)
+    {
+        var p = ReadJson(ctx);
+        var name = GetParam<string>(p, "name");
+        var count = GetParamOr(p, "count", 1);
+
+        if (!Context.IsWorldReady)
+            throw new InvalidOperationException("World not ready");
+
+        var tcs = new TaskCompletionSource<object>();
+        EnqueueMainThread(() =>
+        {
+            var farmer = Game1.player;
+            var item = farmer.Items.FirstOrDefault(i =>
+                i != null && i.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+            if (item == null)
+            {
+                tcs.SetResult(new { ok = false, error = $"Item '{name}' not found in inventory" });
+                return;
+            }
+
+            var tossCount = Math.Min(count, item.Stack);
+            var dropped = item.getOne();
+            dropped.Stack = tossCount;
+
+            if (item.Stack <= tossCount)
+                farmer.removeItemFromInventory(item);
+            else
+                item.Stack -= tossCount;
+
+            Game1.createItemDebris(dropped, farmer.getStandingPosition(), farmer.FacingDirection, farmer.currentLocation);
+            tcs.SetResult(new { ok = true, tossed = dropped.Name, count = tossCount });
         });
         return tcs.Task.GetAwaiter().GetResult();
     }
