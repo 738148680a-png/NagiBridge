@@ -65,6 +65,9 @@ public class ModEntry : Mod
     private bool _lastWaterEmpty;
     private bool _lastInventoryFull;
 
+    // Multiplayer inventory sync message type
+    private const string MSG_ADD_ITEM = "NagiBridge.AddItem";
+
     private readonly PrairieKingBot _prairieKingBot = new();
 
     private readonly FlowerDanceBot _flowerDanceBot = new();
@@ -90,6 +93,7 @@ public class ModEntry : Mod
         helper.Events.Display.RenderedHud += OnRenderedHud;
         helper.Events.Display.Rendered += OnRendered;
         helper.Events.Input.ButtonPressed += OnButtonPressed;
+        helper.Events.Multiplayer.ModMessageReceived += OnModMessageReceived;
 
         _chatHud = new ChatHud(Monitor, OnChatSend, OnApiConfigured, OnChannelSelected);
         _chatHud.SetInitialState(_modConfig.Mode, _modConfig.ApiKey, _modConfig.ApiUrl);
@@ -163,6 +167,75 @@ public class ModEntry : Mod
     private void OnGameLaunched(object? sender, GameLaunchedEventArgs e)
     {
         StartServer();
+    }
+
+    /// <summary>
+    /// Host-side handler: receives AddItem messages from farmhands and adds items
+    /// to the requesting farmhand's inventory. This ensures inventory changes are
+    /// authoritative (host-side) and properly synced in multiplayer.
+    /// </summary>
+    private void OnModMessageReceived(object? sender, ModMessageReceivedEventArgs e)
+    {
+        if (e.Type != MSG_ADD_ITEM || !Context.IsMainPlayer) return;
+
+        try
+        {
+            var data = e.ReadAs<Dictionary<string, JsonElement>>();
+            var farmerId = data["farmerId"].GetInt64();
+            var itemId = data["itemId"].GetString()!;
+            var count = data.ContainsKey("count") ? data["count"].GetInt32() : 1;
+            var quality = data.ContainsKey("quality") ? data["quality"].GetInt32() : 0;
+
+            EnqueueMainThread(() =>
+            {
+                var targetFarmer = Game1.getOnlineFarmers()
+                    .FirstOrDefault(f => f.UniqueMultiplayerID == farmerId);
+                if (targetFarmer == null)
+                {
+                    Monitor.Log($"AddItem: farmhand {farmerId} not found online", LogLevel.Warn);
+                    return;
+                }
+                var item = ItemRegistry.Create(itemId, count);
+                if (item is StardewValley.Object obj && quality > 0)
+                    obj.Quality = quality;
+                targetFarmer.addItemToInventory(item);
+                Monitor.Log($"AddItem: gave {item.Name} x{count} (q{quality}) to {targetFarmer.Name}", LogLevel.Info);
+            });
+        }
+        catch (Exception ex)
+        {
+            Monitor.Log($"AddItem message error: {ex.Message}", LogLevel.Error);
+        }
+    }
+
+    /// <summary>
+    /// Multiplayer-safe addItem: host adds directly, farmhand sends a message to host.
+    /// </summary>
+    private void AddItemSynced(string itemId, int count = 1, int quality = 0)
+    {
+        if (Context.IsMainPlayer)
+        {
+            // Host: add directly
+            var item = ItemRegistry.Create(itemId, count);
+            if (item is StardewValley.Object obj && quality > 0)
+                obj.Quality = quality;
+            Game1.player.addItemToInventory(item);
+        }
+        else
+        {
+            // Farmhand: ask host to add it for us
+            Helper.Multiplayer.SendMessage(
+                new Dictionary<string, object>
+                {
+                    ["farmerId"] = Game1.player.UniqueMultiplayerID,
+                    ["itemId"] = itemId,
+                    ["count"] = count,
+                    ["quality"] = quality
+                },
+                MSG_ADD_ITEM,
+                modIDs: new[] { ModManifest.UniqueID }
+            );
+        }
     }
 
     private void OnReturnedToTitle(object? sender, ReturnedToTitleEventArgs e)
@@ -1362,7 +1435,7 @@ public class ModEntry : Mod
                     if (fields == null || fields.Length < 3 || !int.TryParse(fields[1], out realFishDiff))
                     {
                         // junk / algae / non-fish: no minigame, straight to inventory
-                        farmer.addItemByMenuIfNecessary(rolled);
+                        AddItemSynced(rolled.QualifiedItemId, rolled.Stack);
                         tcs.SetResult(new { ok = true, status = "junk", caught = true, fish = rolled.DisplayName,
                             message = $"钓上来一个 {rolled.DisplayName}……不是鱼，直接进包了" });
                         return;
@@ -1753,16 +1826,15 @@ public class ModEntry : Mod
             if (caught)
             {
                 var fishId = state.FishId;
+                var capturedQuality = fishQuality; // capture for closure
                 EnqueueMainThread(() =>
                 {
                     var xp = Math.Max(3, state.Difficulty / 8);
                     Game1.player.gainExperience(1, xp); // 1 = fishing skill
                     if (fishId != null)
                     {
-                        var fish = ItemRegistry.Create(fishId, 1);
-                        if (fish is StardewValley.Object fo)
-                            fo.Quality = fishQuality;
-                        Game1.player.addItemByMenuIfNecessary(fish);
+                        // Use multiplayer-safe add for farmhand compatibility
+                        AddItemSynced(fishId, 1, capturedQuality);
                     }
                 });
             }
@@ -2469,10 +2541,10 @@ public class ModEntry : Mod
                     return;
                 }
 
-                // Create the actual item and add to inventory
+                // Create the actual item and add to inventory (multiplayer-safe)
                 var item = ItemRegistry.Create(qualifiedId, quantity);
                 farmer.Money -= totalCost;
-                farmer.addItemByMenuIfNecessary(item);
+                AddItemSynced(qualifiedId, quantity);
 
                 tcs.SetResult(new
                 {
@@ -3250,10 +3322,11 @@ public class ModEntry : Mod
         var tcs = new TaskCompletionSource<object>();
         EnqueueMainThread(() =>
         {
-            var farmer = Game1.player;
-            var item = ItemRegistry.Create(itemId, count);
-            farmer.addItemToInventory(item);
-            tcs.SetResult(new { ok = true, given = item.Name, count, id = itemId });
+            // Use multiplayer-safe add: farmhand sends to host, host adds directly
+            AddItemSynced(itemId, count);
+            var item = ItemRegistry.Create(itemId, 1); // just for the name in response
+            tcs.SetResult(new { ok = true, given = item.Name, count, id = itemId,
+                synced = !Context.IsMainPlayer ? "via_host" : "direct" });
         });
         return tcs.Task.GetAwaiter().GetResult();
     }
